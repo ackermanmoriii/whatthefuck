@@ -5,14 +5,19 @@ let mediaSource = null;
 let sourceBuffer = null;
 let fetchController = null;
 let repeat = false;
-let mimeCodec = 'audio/mpeg; codecs="mp3"'; // Adjust based on stream
+let mimeCodec = 'audio/mp4; codecs="mp4a.40.2"'; // Changed to AAC for better support
 
 async function performSearch() {
     const query = document.getElementById('search-bar').value;
-    const response = await fetch(`/search?query=${encodeURIComponent(query)}`);
-    const results = await response.json();
-    displayResults(results);
-    currentSongs = results; // For playlist navigation
+    try {
+        const response = await fetch(`/search?query=${encodeURIComponent(query)}`);
+        if (!response.ok) throw new Error('Search failed');
+        const results = await response.json();
+        displayResults(results);
+        currentSongs = results; // For playlist navigation
+    } catch (error) {
+        console.error('Search error:', error);
+    }
 }
 
 function displayResults(results) {
@@ -21,62 +26,73 @@ function displayResults(results) {
     results.forEach((item, index) => {
         const div = document.createElement('div');
         div.textContent = `${item.title} by ${item.artists?.[0]?.name || 'Unknown'}`;
-        div.onclick = () => playSong(item, index); // Pass full item instead of just videoId
+        div.onclick = () => playSong(item, index);
         resultsDiv.appendChild(div);
     });
 }
 
-async function playSong(item, index) { // Change param to item
+async function playSong(item, index) {
     currentVideoId = item.videoId;
     songIndex = index;
     document.getElementById('player-controls').classList.remove('hidden');
     document.getElementById('sidebar').classList.remove('hidden');
 
-    // Load similar and artist
     loadSimilar(item.videoId);
-    loadArtist(item.artists?.[0]?.id); // Now item is available
+    loadArtist(item.artists?.[0]?.id);
 
-    // Start streaming with MSE
-    clearMediaSource(); // Clear previous
+    clearMediaSource();
     const audio = document.getElementById('audio-player');
     mediaSource = new MediaSource();
-    audio.src = URL.createObjectURL(mediaSource);
-    mediaSource.addEventListener('sourceopen', () => {
+    const objectURL = URL.createObjectURL(mediaSource);
+    audio.src = objectURL;
+    await new Promise(resolve => mediaSource.addEventListener('sourceopen', resolve, { once: true }));
+    try {
         sourceBuffer = mediaSource.addSourceBuffer(mimeCodec);
-        streamAudio(item.videoId); // Use item.videoId
-    });
-    await audio.play().catch(error => console.error('Playback failed:', error)); // Use await to handle play promise
+        await streamAudio(item.videoId);
+        audio.play().catch(error => console.error('Playback failed:', error));
+    } catch (error) {
+        console.error('MSE error:', error);
+        URL.revokeObjectURL(objectURL);
+    }
 }
 
 async function streamAudio(videoId) {
     fetchController = new AbortController();
-    const response = await fetch(`/stream/${videoId}`, { signal: fetchController.signal });
-    const reader = response.body.getReader();
-    let updatingPromise = null;
-    while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (sourceBuffer.updating) {
-            if (!updatingPromise) {
-                updatingPromise = new Promise(resolve => sourceBuffer.addEventListener('updateend', () => { updatingPromise = null; resolve(); }, { once: true }));
+    try {
+        const response = await fetch(`/stream/${videoId}`, { signal: fetchController.signal });
+        if (!response.ok) throw new Error('Stream failed');
+        const reader = response.body.getReader();
+        let updatingPromise = null;
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (sourceBuffer.updating) {
+                if (!updatingPromise) {
+                    updatingPromise = new Promise(resolve => sourceBuffer.addEventListener('updateend', () => { updatingPromise = null; resolve(); }, { once: true }));
+                }
+                await updatingPromise;
             }
-            await updatingPromise;
+            sourceBuffer.appendBuffer(value);
         }
-        sourceBuffer.appendBuffer(value);
+        mediaSource.endOfStream();
+    } catch (error) {
+        console.error('Stream error:', error);
     }
-    mediaSource.endOfStream();
 }
 
 function clearMediaSource() {
     if (fetchController) fetchController.abort();
     if (mediaSource && sourceBuffer) {
-        if (!sourceBuffer.updating) {
-            mediaSource.removeSourceBuffer(sourceBuffer);
+        if (sourceBuffer.updating) {
+            sourceBuffer.addEventListener('updateend', () => {
+                if (sourceBuffer) mediaSource.removeSourceBuffer(sourceBuffer);
+            }, { once: true });
         } else {
-            // Wait for update to finish before removing
-            sourceBuffer.addEventListener('updateend', () => mediaSource.removeSourceBuffer(sourceBuffer), { once: true });
+            mediaSource.removeSourceBuffer(sourceBuffer);
         }
-        URL.revokeObjectURL(document.getElementById('audio-player').src);
+        const audio = document.getElementById('audio-player');
+        URL.revokeObjectURL(audio.src);
+        audio.src = '';
         mediaSource = null;
         sourceBuffer = null;
     }
@@ -113,35 +129,43 @@ function toggleRepeat() {
     repeat = !repeat;
     document.getElementById('repeat-btn').textContent = `Repeat: ${repeat ? 'On' : 'Off'}`;
     const audio = document.getElementById('audio-player');
-    audio.loop = repeat; // Use native loop for repeat
+    audio.loop = repeat;
 }
 
-let similarTracks = []; // Store similar tracks globally for collection view
+let similarTracks = [];
 async function loadSimilar(videoId) {
-    const response = await fetch(`/similar?video_id=${videoId}`);
-    similarTracks = await response.json();
-    // You can pre-populate if needed, but wait for button click
+    try {
+        const response = await fetch(`/similar?video_id=${videoId}`);
+        if (!response.ok) throw new Error('Similar fetch failed');
+        similarTracks = await response.json();
+    } catch (error) {
+        console.error('Load similar error:', error);
+    }
 }
 
 function showSimilarCollection() {
     const collectionDiv = document.getElementById('similar-collection');
     collectionDiv.classList.toggle('hidden');
-    if (!collectionDiv.innerHTML) { // Populate if not already
+    if (!collectionDiv.innerHTML && similarTracks.length > 0) {
         similarTracks.forEach(track => {
             const div = document.createElement('div');
             div.textContent = `${track.title} by ${track.artists?.[0]?.name || 'Unknown'}`;
-            div.onclick = () => playSong(track, -1); // -1 for non-playlist index
+            div.onclick = () => playSong(track, -1);
             collectionDiv.appendChild(div);
         });
     }
 }
 
-let artistSongs = []; // Store artist songs globally for view
+let artistSongs = [];
 async function loadArtist(channelId) {
-    if (!channelId) return; // Guard if no artist ID
-    const response = await fetch(`/artist?channel_id=${channelId}`);
-    artistSongs = await response.json();
-    // Wait for button click to display
+    if (!channelId) return;
+    try {
+        const response = await fetch(`/artist?channel_id=${channelId}`);
+        if (!response.ok) throw new Error('Artist fetch failed');
+        artistSongs = await response.json();
+    } catch (error) {
+        console.error('Load artist error:', error);
+    }
 }
 
 function showArtistView() {
@@ -153,14 +177,13 @@ function showArtistView() {
     let sortedSongs = [...artistSongs];
 
     if (sortOption === 'popularity' || sortOption === 'likes') {
-        // Proxy with views (assuming 'views' field exists as string like '1M views')
         sortedSongs.sort((a, b) => {
             const viewsA = parseInt(a.views?.replace(/\D/g, '') || 0);
             const viewsB = parseInt(b.views?.replace(/\D/g, '') || 0);
-            return viewsB - viewsA; // Descending
+            return viewsB - viewsA;
         });
     } else if (sortOption === 'latest') {
-        sortedSongs.sort((a, b) => (b.year || 0) - (a.year || 0)); // Assuming 'year' field
+        sortedSongs.sort((a, b) => (b.year || 0) - (a.year || 0));
     } else if (sortOption === 'oldest') {
         sortedSongs.sort((a, b) => (a.year || 0) - (b.year || 0));
     }
@@ -175,5 +198,4 @@ function showArtistView() {
     });
 }
 
-// Add event for sort change to re-display
 document.getElementById('sort-option').addEventListener('change', showArtistView);
