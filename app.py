@@ -1,9 +1,12 @@
-from flask import Flask, request, Response, jsonify
+from flask import Flask, request, Response, jsonify, send_from_directory
 import ytmusicapi
 import yt_dlp
 import requests
+from flask_cors import CORS  # Add if needed for JS cross-origin
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder='.', static_url_path='')
+CORS(app)  # Optional: If frontend JS calls have CORS issues
+
 ytmusic = ytmusicapi.YTMusic()
 
 def get_audio_stream_url(video_id):
@@ -15,7 +18,7 @@ def get_audio_stream_url(video_id):
 @app.route('/search', methods=['GET'])
 def search():
     query = request.args.get('query')
-    filter_type = request.args.get('filter', 'songs')  # Can be 'songs', 'albums', 'artists'
+    filter_type = request.args.get('filter', 'songs')
     results = ytmusic.search(query, filter=filter_type)
     return jsonify(results)
 
@@ -23,7 +26,7 @@ def search():
 def similar():
     video_id = request.args.get('video_id')
     watch_playlist = ytmusic.get_watch_playlist(video_id)
-    related = watch_playlist.get('tracks', [])[1:]  # Skip the first (current song)
+    related = watch_playlist.get('tracks', [])[1:]
     return jsonify(related)
 
 @app.route('/artist', methods=['GET'])
@@ -31,7 +34,6 @@ def artist():
     channel_id = request.args.get('channel_id')
     artist_data = ytmusic.get_artist(channel_id)
     songs = artist_data.get('songs', {}).get('results', [])
-    # Fetch more if needed via browseId
     if 'browseId' in artist_data.get('songs', {}):
         full_songs = ytmusic.get_artist(artist_data['songs']['browseId']).get('songs', {}).get('results', [])
         songs.extend(full_songs)
@@ -50,5 +52,15 @@ def stream(video_id):
     
     return Response(generate(), mimetype='audio/mpeg')
 
-if __name__ == '__main__':
-    app.run(debug=True)
+# Serve static frontend files
+@app.route('/')
+def serve_index():
+    return send_from_directory('.', 'index.html')
+
+@app.route('/<path:path>')
+def serve_static(path):
+    return send_from_directory('.', path)
+
+# Remove this for production
+# if __name__ == '__main__':
+#     app.run(debug=True)
