@@ -1,6 +1,6 @@
 flask==3.0.3
 flask-cors==5.0.0
 ytmusicapi==1.8.1
-yt-dlp==2024.11.4
+yt-dlp==2024.11.25    # ← latest version (fixes many 404s)
 requests==2.32.3
 gunicorn==23.0.0
