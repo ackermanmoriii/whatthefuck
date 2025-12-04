@@ -1,17 +1,27 @@
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 import yt_dlp
-import json
+import requests
+import logging
+
+# Configure logging to see the real error in Koyeb logs
+logging.basicConfig(level=logging.DEBUG)
 
 app = Flask(__name__, static_folder='static', static_url_path='')
 CORS(app)
 
-# Configure yt-dlp to avoid downloading files and just fetch metadata/urls
+# 1. Anti-Bot Headers & Config
+# We use a real browser User-Agent to avoid 403 blocks from YouTube
 YDL_OPTIONS = {
     'format': 'bestaudio/best',
     'noplaylist': True,
-    'quiet': True,
-    'skip_download': True, # Critical: We only want the URL, not the file on disk
+    'quiet': False, # Turn on logs for debugging
+    'skip_download': True,
+    'nocheckcertificate': True,
+    'geo_bypass': True,
+    'source_address': '0.0.0.0',
+    # Spoof a common browser to avoid bot detection
+    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
 }
 
 @app.route('/')
@@ -25,13 +35,12 @@ def search_music():
         return jsonify({'error': 'No query provided'}), 400
 
     try:
-        # Search for 10 results
         search_opts = YDL_OPTIONS.copy()
-        search_opts['extract_flat'] = True  # Just get metadata quickly
+        search_opts['extract_flat'] = True
         
         with yt_dlp.YoutubeDL(search_opts) as ydl:
-            # "ytsearch10:" tells yt-dlp to search youtube and return 10 results
-            info = ydl.extract_info(f"ytsearch10:{query}", download=False)
+            # Search 5 items for speed
+            info = ydl.extract_info(f"ytsearch5:{query}", download=False)
             
             results = []
             if 'entries' in info:
@@ -39,45 +48,62 @@ def search_music():
                     results.append({
                         'id': entry['id'],
                         'title': entry['title'],
-                        'uploader': entry.get('uploader', 'Unknown Artist'),
+                        'uploader': entry.get('uploader', 'Unknown'),
                         'thumbnail': f"https://i.ytimg.com/vi/{entry['id']}/hqdefault.jpg",
-                        'duration': entry.get('duration')
                     })
             return jsonify(results)
     except Exception as e:
+        app.logger.error(f"Search Error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/stream/<video_id>')
 def stream_audio(video_id):
     """
-    Get the direct streaming URL from YouTube and pipe it.
-    This does NOT save the file to the server.
+    Step 1: Get the YouTube URL.
+    Step 2: Tell the frontend to ask US for the audio, not YouTube directly.
     """
     try:
-        with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
-            info = ydl.extract_info(video_id, download=False)
-            url = info['url']
-            
-            # We redirect the client to the direct googlevideo URL.
-            # This is the most efficient way to stream without burdening the Flask server bandwidth
-            # and it keeps the server stateless (no storage used).
-            return jsonify({'stream_url': url, 'title': info['title'], 'uploader': info['uploader']})
+        # Instead of returning the GoogleVideo URL (which breaks on mobile/different IPs),
+        # We return a URL pointing back to THIS server's proxy route.
+        # This solves the "NotSupportedError" and IP mismatch.
+        
+        return jsonify({
+            # The frontend will now load: /api/proxy/VIDEO_ID
+            'stream_url': f"/api/proxy/{video_id}", 
+            'title': "Loading...",
+            'uploader': "..."
+        })
             
     except Exception as e:
+        app.logger.error(f"Stream Info Error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/artist_info', methods=['GET'])
-def artist_info():
+@app.route('/api/proxy/<video_id>')
+def proxy_stream(video_id):
     """
-    Mock function to simulate sorting artist data. 
-    Real YouTube Music API Artist scraping is complex and prone to breaking.
-    This logic fulfills the requirement logic on the gathered data.
+    Step 3: The Actual Proxy.
+    The browser connects here. We connect to YouTube. We pass the data bucket-brigade style.
     """
-    # In a production app, you would use the 'channel_url' from the search
-    # to fetch specific artist metadata.
-    artist_name = request.args.get('artist')
-    # Placeholder for logic - usually requires extensive scraping
-    return jsonify({'message': f"Sorting/Artist view logic for {artist_name} implemented here"})
+    try:
+        # 1. Get the real Googlevideo URL using yt-dlp
+        with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
+            info = ydl.extract_info(video_id, download=False)
+            real_url = info['url']
+        
+        # 2. Open a connection to that URL from the SERVER
+        req = requests.get(real_url, stream=True)
+        
+        # 3. Stream chunks of data to the browser
+        def generate():
+            for chunk in req.iter_content(chunk_size=1024 * 64): # 64KB chunks
+                yield chunk
+
+        # Return the stream with correct headers
+        return Response(stream_with_context(generate()), content_type="audio/mp4")
+
+    except Exception as e:
+        app.logger.error(f"Proxy Error: {str(e)}")
+        return jsonify({'error': "Stream proxy failed"}), 500
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8000, debug=True)
+    app.run(host='0.0.0.0', port=8000)
